@@ -7,25 +7,84 @@ import httpx
 
 
 class NotificationKit:
-	def __init__(self):
-		self.email_user: str = os.getenv('EMAIL_USER', '')
-		self.email_pass: str = os.getenv('EMAIL_PASS', '')
-		self.email_to: str = os.getenv('EMAIL_TO', '')
-		self.email_sender: str = os.getenv('EMAIL_SENDER', '')
-		self.smtp_server: str = os.getenv('CUSTOM_SMTP_SERVER', '')
-		self.pushplus_token = os.getenv('PUSHPLUS_TOKEN')
-		self.server_push_key = os.getenv('SERVERPUSHKEY')
-		self.dingding_webhook = os.getenv('DINGDING_WEBHOOK')
-		self.feishu_webhook = os.getenv('FEISHU_WEBHOOK')
-		self.weixin_webhook = os.getenv('WEIXIN_WEBHOOK')
-		self.gotify_url = os.getenv('GOTIFY_URL')
-		self.gotify_token = os.getenv('GOTIFY_TOKEN')
+	"""多平台通知工具。
+
+	所有配置项都是**惰性属性**，在真正发送时才读取环境变量，而不是在实例化时快照。
+
+	注意：`notify` 是本模块级单例，会在 `utils.notify` 被导入时就创建。如果在这里快照
+	环境变量，那么任何「先导入 utils.notify、后调用 load_dotenv()」的入口（checkin.py
+	即是如此）都会拿到一份空配置，导致本地 .env 里配好的通知渠道全部失效，且失败信息
+	会误导为 "xxx not configured"。保持惰性读取可以让配置与导入顺序无关。
+	"""
+
+	@property
+	def email_user(self) -> str:
+		return os.getenv('EMAIL_USER', '')
+
+	@property
+	def email_pass(self) -> str:
+		return os.getenv('EMAIL_PASS', '')
+
+	@property
+	def email_to(self) -> str:
+		return os.getenv('EMAIL_TO', '')
+
+	@property
+	def email_sender(self) -> str:
+		return os.getenv('EMAIL_SENDER', '')
+
+	@property
+	def smtp_server(self) -> str:
+		return os.getenv('CUSTOM_SMTP_SERVER', '')
+
+	@property
+	def pushplus_token(self) -> str | None:
+		return os.getenv('PUSHPLUS_TOKEN')
+
+	@property
+	def server_push_key(self) -> str | None:
+		return os.getenv('SERVERPUSHKEY')
+
+	@property
+	def dingding_webhook(self) -> str | None:
+		return os.getenv('DINGDING_WEBHOOK')
+
+	@property
+	def feishu_webhook(self) -> str | None:
+		return os.getenv('FEISHU_WEBHOOK')
+
+	@property
+	def weixin_webhook(self) -> str | None:
+		return os.getenv('WEIXIN_WEBHOOK')
+
+	@property
+	def gotify_url(self) -> str | None:
+		return os.getenv('GOTIFY_URL')
+
+	@property
+	def gotify_token(self) -> str | None:
+		return os.getenv('GOTIFY_TOKEN')
+
+	@property
+	def gotify_priority(self) -> int:
 		gotify_priority_env = os.getenv('GOTIFY_PRIORITY', '9')
-		self.gotify_priority = int(gotify_priority_env) if gotify_priority_env.strip() else 9
-		self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-		self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
-		self.bark_key = os.getenv('BARK_KEY')
-		self.bark_server = os.getenv('BARK_SERVER', 'https://api.day.app')
+		return int(gotify_priority_env) if gotify_priority_env.strip() else 9
+
+	@property
+	def telegram_bot_token(self) -> str | None:
+		return os.getenv('TELEGRAM_BOT_TOKEN')
+
+	@property
+	def telegram_chat_id(self) -> str | None:
+		return os.getenv('TELEGRAM_CHAT_ID')
+
+	@property
+	def bark_key(self) -> str | None:
+		return os.getenv('BARK_KEY')
+
+	@property
+	def bark_server(self) -> str:
+		return os.getenv('BARK_SERVER', 'https://api.day.app')
 
 	def _post_json(self, service: str, url: str, data: dict[str, Any]) -> httpx.Response:
 		with httpx.Client(timeout=30.0) as client:

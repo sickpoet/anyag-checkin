@@ -180,48 +180,113 @@ class AccountConfig:
 		return self.name if self.name else f'Account {index + 1}'
 
 
-def load_accounts_config() -> list[AccountConfig] | None:
-	"""从环境变量加载账号配置"""
-	accounts_str = os.getenv('ANYROUTER_ACCOUNTS')
-	if not accounts_str:
-		print('ERROR: ANYROUTER_ACCOUNTS environment variable not found')
-		return None
+BASE_ACCOUNTS_ENV = 'ANYROUTER_ACCOUNTS'
+EXTRA_ACCOUNTS_ENV = 'ANYROUTER_ACCOUNTS_EXTRA'
 
+
+def _parse_accounts_json(raw: str, source: str) -> list[dict] | None:
+	"""解析账号 JSON 数组，返回原始字典列表（凭据校验留到合并之后）。"""
 	try:
-		accounts_data = json.loads(accounts_str)
+		accounts_data = json.loads(raw)
 	except json.JSONDecodeError as e:
-		print(f'ERROR: ANYROUTER_ACCOUNTS JSON 解析失败: {e}')
+		print(f'ERROR: {source} JSON 解析失败: {e}')
 		print('HINT: 常见原因 - 末尾多余逗号、使用了单引号、包含注释、或换行格式问题')
 		return None
 
-	try:
-		if not isinstance(accounts_data, list):
-			print('ERROR: Account configuration must use array format [{}]')
+	if not isinstance(accounts_data, list):
+		print(f'ERROR: {source} must use array format [{{}}]')
+		return None
+
+	accounts: list[dict] = []
+	for i, account_dict in enumerate(accounts_data):
+		if not isinstance(account_dict, dict):
+			print(f'ERROR: {source} account {i + 1} configuration format is incorrect')
 			return None
 
+		if 'name' in account_dict and not account_dict['name']:
+			print(f'ERROR: {source} account {i + 1} name field cannot be empty')
+			return None
+
+		accounts.append(account_dict)
+
+	return accounts
+
+
+def _merge_accounts(base: list[dict], extra: list[dict]) -> tuple[list[dict], list[str]]:
+	"""按 name 合并账号：同名做字段级覆盖，新名字追加到末尾。
+
+	覆盖时 extra 的字段优先，且允许只给片段。因此可以在 ANYROUTER_ACCOUNTS_EXTRA 里写
+	{"name": "agGithub", "email": "...", "password": "..."}，让已有账号改用邮箱密码登录，
+	而不必重写基础的 ANYROUTER_ACCOUNTS（GitHub secret 只写不可读，改不动单个账号）。
+
+	被覆盖条目里遗留的 cookies 会保留在字典中，但 check_in_account 优先使用邮箱密码，
+	所以不会生效。没有 name 的条目无法定位到已有账号，直接追加。
+	"""
+	merged = [dict(item) for item in base]
+	index_by_name = {item['name']: i for i, item in enumerate(merged) if item.get('name')}
+
+	overridden: list[str] = []
+	for item in extra:
+		name = item.get('name')
+		if name and name in index_by_name:
+			merged[index_by_name[name]].update(item)
+			overridden.append(name)
+		else:
+			merged.append(dict(item))
+			if name:
+				index_by_name[name] = len(merged) - 1
+
+	return merged, overridden
+
+
+def _validate_account(account_dict: dict, index: int) -> bool:
+	"""校验合并后的单个账号条目。"""
+	label = account_dict.get('name') or f'Account {index + 1}'
+	has_cookies = bool(account_dict.get('cookies'))
+	has_login = bool(account_dict.get('email') and account_dict.get('password'))
+
+	if not has_cookies and not has_login:
+		print(f'ERROR: Account "{label}" must have either cookies or email+password')
+		return False
+
+	if 'api_user' not in account_dict and not has_login:
+		print(f'ERROR: Account "{label}" missing required field (api_user) - only email+password login can omit it')
+		return False
+
+	return True
+
+
+def load_accounts_config() -> list[AccountConfig] | None:
+	"""从环境变量加载账号配置。
+
+	- ANYROUTER_ACCOUNTS：基础账号数组（必填）
+	- ANYROUTER_ACCOUNTS_EXTRA：可选增量数组，按 name 覆盖同名账号或追加新账号
+	"""
+	accounts_str = os.getenv(BASE_ACCOUNTS_ENV)
+	if not accounts_str:
+		print(f'ERROR: {BASE_ACCOUNTS_ENV} environment variable not found')
+		return None
+
+	accounts_data = _parse_accounts_json(accounts_str, BASE_ACCOUNTS_ENV)
+	if accounts_data is None:
+		return None
+
+	merged = accounts_data
+	extra_str = (os.getenv(EXTRA_ACCOUNTS_ENV) or '').strip()
+	if extra_str:
+		extra_data = _parse_accounts_json(extra_str, EXTRA_ACCOUNTS_ENV)
+		if extra_data is None:
+			return None
+
+		merged, overridden = _merge_accounts(accounts_data, extra_data)
+		print(f'[INFO] {EXTRA_ACCOUNTS_ENV}: merged {len(extra_data)} account(s) into {len(accounts_data)}')
+		for name in overridden:
+			print(f'[INFO] {EXTRA_ACCOUNTS_ENV} overrides account "{name}"')
+
+	try:
 		accounts = []
-		for i, account_dict in enumerate(accounts_data):
-			if not isinstance(account_dict, dict):
-				print(f'ERROR: Account {i + 1} configuration format is incorrect')
-				return None
-
-			if 'api_user' not in account_dict:
-				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
-					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
-					)
-					return None
-
-			has_cookies = 'cookies' in account_dict and account_dict['cookies']
-			has_login = account_dict.get('email') and account_dict.get('password')
-
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
-				return None
-
-			if 'name' in account_dict and not account_dict['name']:
-				print(f'ERROR: Account {i + 1} name field cannot be empty')
+		for i, account_dict in enumerate(merged):
+			if not _validate_account(account_dict, i):
 				return None
 
 			accounts.append(AccountConfig.from_dict(account_dict, i))

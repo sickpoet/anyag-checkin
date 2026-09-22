@@ -102,6 +102,28 @@
 
 ![获取 api_user](./assets/request-api-user.png)
 
+#### 增量账号配置（可选）
+
+如果只想修正或新增**某一个**账号，而不想重写整个 `ANYROUTER_ACCOUNTS`（GitHub secret 只写不可读，读不回原值），可以额外配置一个 `ANYROUTER_ACCOUNTS_EXTRA` secret：
+
+- **同名覆盖**：按 `name` 匹配已有账号，做字段级合并，只覆盖你写了的字段
+- **新名字追加**：`name` 不在 `ANYROUTER_ACCOUNTS` 里的，追加到列表末尾
+
+例如把 `agGithub` 从会过期的 session cookies 换成邮箱密码登录，其它账号完全不动：
+
+```json
+[{"name": "agGithub", "email": "you@example.com", "password": "your_password"}]
+```
+
+配置位置与 `ANYROUTER_ACCOUNTS` 相同：Settings -> Environments -> production -> Environment secrets。
+
+注意：
+
+- 未在增量里出现的字段（如 `provider`、`api_user`）会保留原值
+- 覆盖后旧条目里的 `cookies` 仍保留在配置中，但脚本优先使用邮箱密码登录，因此不会生效
+- `ANYROUTER_ACCOUNTS_EXTRA` 是**可选**的，不配置时行为与之前完全一致
+- 增量 JSON 格式错误时脚本会直接报错退出，不会静默忽略
+
 ### 5. 启用 GitHub Actions
 
 1. 在你的仓库中，点击 "Actions" 选项卡
