@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -41,6 +42,41 @@ from utils.proxy import get_playwright_proxy, get_proxy_server
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+
+# 签到结果状态。
+# 之前通知里只看余额差，导致「真的调用了签到接口」和「今天已经签过」都渲染成同一句
+# 「今日已签到，无变化」，从消息里根本看不出签到到底成功没有。现在显式区分。
+STATUS_CHECKED_IN = 'checked_in'
+STATUS_ALREADY_CHECKED = 'already_checked'
+STATUS_AUTO_CHECKED = 'auto'
+STATUS_FAILED = 'failed'
+
+CHECK_IN_STATUS_LABELS = {
+	STATUS_CHECKED_IN: '✅ 签到成功',
+	STATUS_ALREADY_CHECKED: '✅ 今日已签到（本次为重复调用）',
+	STATUS_AUTO_CHECKED: '✅ 签到成功（查询用户信息时自动触发）',
+	STATUS_FAILED: '❌ 签到失败',
+}
+
+
+@dataclass
+class CheckInOutcome:
+	"""单个账号的签到结果。
+
+	success 表示「今天该账号的签到已完成」，因此 already_checked / auto 也算成功。
+	message 用于在通知里补充失败原因等说明。
+	"""
+
+	status: str
+	message: str = ''
+
+	@property
+	def success(self) -> bool:
+		return self.status != STATUS_FAILED
+
+	@property
+	def label(self) -> str:
+		return CHECK_IN_STATUS_LABELS.get(self.status, self.status)
 
 
 def load_balance_hash():
@@ -277,8 +313,8 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 	return {**waf_cookies, **user_cookies}
 
 
-def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求"""
+def execute_check_in(client, account_name: str, provider_config, headers: dict) -> CheckInOutcome:
+	"""执行签到请求，返回区分「签到成功」与「今日已签到」的结果。"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
@@ -289,36 +325,42 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
 
-	if response.status_code == 200:
-		try:
-			result = response.json()
-			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
-				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
-					print(f'[SUCCESS] {account_name}: Already checked in today')
-					return True
-				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False
-		except json.JSONDecodeError:
-			if 'success' in response.text.lower():
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False
-	else:
+	if response.status_code != 200:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-		return False
+		return CheckInOutcome(STATUS_FAILED, f'HTTP {response.status_code}')
+
+	try:
+		result = response.json()
+	except json.JSONDecodeError:
+		if 'success' in response.text.lower():
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+			return CheckInOutcome(STATUS_CHECKED_IN)
+		print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
+		return CheckInOutcome(STATUS_FAILED, '响应不是有效 JSON')
+
+	if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
+		print(f'[SUCCESS] {account_name}: Check-in successful!')
+		return CheckInOutcome(STATUS_CHECKED_IN)
+
+	error_msg = result.get('msg', result.get('message', 'Unknown error'))
+	already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
+	if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
+		print(f'[SUCCESS] {account_name}: Already checked in today')
+		return CheckInOutcome(STATUS_ALREADY_CHECKED)
+
+	print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
+	return CheckInOutcome(STATUS_FAILED, str(error_msg))
 
 
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
+	status_label = CHECK_IN_STATUS_LABELS.get(detail.get('status', ''), '')
+	title = f'[CHECK-IN] {detail["name"]}'
+	if status_label:
+		title += f'  {status_label}'
+
 	lines = [
-		f'[CHECK-IN] {detail["name"]}',
+		title,
 		'  ━━━━━━━━━━━━━━━━━━━━',
 		'  签到前',
 		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
@@ -326,17 +368,19 @@ def format_check_in_notification(detail: dict) -> str:
 		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
 	]
 
+	if detail.get('message'):
+		lines.append(f'  说明: {detail["message"]}')
+
 	has_reward = detail['check_in_reward'] != 0
 	has_usage = detail['usage_increase'] != 0
 
 	if has_reward or has_usage:
 		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
 
-		if not has_reward and has_usage:
-			lines.append('  今日已签到（期间有使用）')
-
 		if has_reward:
 			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
+		elif has_usage:
+			lines.append('  本次未检测到签到奖励')
 
 		if has_usage:
 			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
@@ -345,12 +389,14 @@ def format_check_in_notification(detail: dict) -> str:
 			change_symbol = '+' if detail['balance_change'] > 0 else ''
 			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
 	else:
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
+		lines.append('  余额无变化')
 
 	return '\n'.join(lines)
 
 
-async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
+async def check_in_account(
+	account: AccountConfig, account_index: int, app_config: AppConfig
+) -> tuple[CheckInOutcome, dict | None, dict | None]:
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
 	print(f'\n[PROCESSING] Starting to process {account_name}')
@@ -358,7 +404,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None, None
+		return CheckInOutcome(STATUS_FAILED, f'provider "{account.provider}" 未配置'), None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
@@ -382,17 +428,17 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
-			return False, None, None
+			return CheckInOutcome(STATUS_FAILED, '邮箱密码登录失败'), None, None
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
-			return False, None, None
+			return CheckInOutcome(STATUS_FAILED, '账号缺少可用的 cookies 或邮箱密码'), None, None
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
 	if not all_cookies:
-		return False, None, None
+		return CheckInOutcome(STATUS_FAILED, '未能获取到可用 cookies'), None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
@@ -414,7 +460,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
-) -> tuple[bool, dict | None, dict | None]:
+) -> tuple[CheckInOutcome, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
 		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
@@ -456,21 +502,21 @@ def run_check_in_requests(
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
+				outcome = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
+				return outcome, user_info_before, user_info_after
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return True, user_info_before, user_info_after
+				return CheckInOutcome(STATUS_AUTO_CHECKED), user_info_before, user_info_after
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
-			return False, user_info_before, user_info_after
+			return CheckInOutcome(STATUS_FAILED, str(error)), user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-		return False, None, None
+		return CheckInOutcome(STATUS_FAILED, str(e)[:50]), None, None
 
 
 async def main():
@@ -508,6 +554,7 @@ async def main():
 	success_count = 0
 	total_count = len(accounts)
 	notification_content = []
+	status_lines: list[str] = []
 	current_balances = {}
 	account_check_in_details = {}
 	need_notify = False
@@ -515,17 +562,19 @@ async def main():
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
+		account_name = account.get_display_name(i)
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
-			if success:
+			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			if outcome.success:
 				success_count += 1
 
-			should_notify_this_account = False
+			status_line = f'  {outcome.label} {account_name}'
+			if outcome.message:
+				status_line += f' —— {outcome.message}'
+			status_lines.append(status_line)
 
-			if not success:
-				should_notify_this_account = True
+			if not outcome.success:
 				need_notify = True
-				account_name = account.get_display_name(i)
 				print(f'[NOTIFY] {account_name} failed, will send notification')
 
 			if user_info_after and user_info_after.get('success'):
@@ -555,13 +604,14 @@ async def main():
 						'check_in_reward': check_in_reward,
 						'usage_increase': usage_increase,
 						'balance_change': balance_change,
-						'success': success,
+						'status': outcome.status,
+						'message': outcome.message,
 					}
 
-			if should_notify_this_account:
-				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+			if not outcome.success:
+				account_result = f'{outcome.label} {account_name}'
+				if outcome.message:
+					account_result += f'\n  原因: {outcome.message}'
 				if user_info_after and user_info_after.get('success'):
 					account_result += f'\n{user_info_after["display"]}'
 				elif user_info_after:
@@ -569,10 +619,10 @@ async def main():
 				notification_content.append(account_result)
 
 		except Exception as e:
-			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			status_lines.append(f'  ❌ {account_name} —— 执行异常: {str(e)[:50]}...')
+			notification_content.append(f'❌ {account_name} —— 执行异常: {str(e)[:50]}...')
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
@@ -616,7 +666,13 @@ async def main():
 
 		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		sections = [time_info]
+		if status_lines:
+			sections.append('\n'.join(['[STATUS] 账号签到状态总览:', *status_lines]))
+		sections.append('\n'.join(notification_content))
+		sections.append('\n'.join(summary))
+
+		notify_content = '\n\n'.join(sections)
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
 			github_run_id = os.getenv('GITHUB_RUN_ID', '').strip()
