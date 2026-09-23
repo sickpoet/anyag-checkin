@@ -46,6 +46,10 @@ BALANCE_HASH_FILE = 'balance_hash.txt'
 # 签到结果状态。
 # 之前通知里只看余额差，导致「真的调用了签到接口」和「今天已经签过」都渲染成同一句
 # 「今日已签到，无变化」，从消息里根本看不出签到到底成功没有。现在显式区分。
+#
+# 注意 STATUS_AUTO_CHECKED 的证据强度低于前两者：agentrouter 没有签到接口
+# （sign_in_path 为 None），只能确认「查询用户信息成功」，拿不到服务端对签到本身的
+# 显式回执。因此它的措辞不声称「签到成功」，只说明"已触发、未获接口确认"。
 STATUS_CHECKED_IN = 'checked_in'
 STATUS_ALREADY_CHECKED = 'already_checked'
 STATUS_AUTO_CHECKED = 'auto'
@@ -54,7 +58,7 @@ STATUS_FAILED = 'failed'
 CHECK_IN_STATUS_LABELS = {
 	STATUS_CHECKED_IN: '✅ 签到成功',
 	STATUS_ALREADY_CHECKED: '✅ 今日已签到（本次为重复调用）',
-	STATUS_AUTO_CHECKED: '✅ 签到成功（查询用户信息时自动触发）',
+	STATUS_AUTO_CHECKED: '✅ 已触发自动签到（未获接口确认）',
 	STATUS_FAILED: '❌ 签到失败',
 }
 
@@ -64,6 +68,8 @@ class CheckInOutcome:
 	"""单个账号的签到结果。
 
 	success 表示「今天该账号的签到已完成」，因此 already_checked / auto 也算成功。
+	但三者的证据强度不同：checked_in / already_checked 来自服务端回执，
+	auto 只表示"查询成功、服务端据此自动签到"，拿不到签到本身的确认。
 	message 用于在通知里补充失败原因等说明。
 	"""
 

@@ -46,7 +46,7 @@ def test_labels_distinguish_each_status():
 	labels = {
 		STATUS_CHECKED_IN: '✅ 签到成功',
 		STATUS_ALREADY_CHECKED: '✅ 今日已签到（本次为重复调用）',
-		STATUS_AUTO_CHECKED: '✅ 签到成功（查询用户信息时自动触发）',
+		STATUS_AUTO_CHECKED: '✅ 已触发自动签到（未获接口确认）',
 		STATUS_FAILED: '❌ 签到失败',
 	}
 	for status, expected in labels.items():
@@ -54,6 +54,34 @@ def test_labels_distinguish_each_status():
 
 	# 四种状态的标签必须互不相同，否则通知里又分不出来了
 	assert len(set(labels.values())) == 4
+
+
+def test_auto_label_does_not_claim_confirmed_check_in():
+	"""agentrouter 没有签到接口，只能确认"查询成功"，不能声称"签到成功"。
+
+	它的证据强度低于 checked_in / already_checked，措辞必须体现这一点。
+	"""
+	label = CheckInOutcome(STATUS_AUTO_CHECKED).label
+
+	assert '签到成功' not in label
+	assert '未获接口确认' in label
+
+
+def test_only_server_confirmed_statuses_claim_check_in_success():
+	"""只有拿到服务端回执的状态才允许声称签到已完成。"""
+	confirmed = CheckInOutcome(STATUS_CHECKED_IN).label
+	already = CheckInOutcome(STATUS_ALREADY_CHECKED).label
+	unconfirmed = CheckInOutcome(STATUS_AUTO_CHECKED).label
+	failed = CheckInOutcome(STATUS_FAILED).label
+
+	assert '签到成功' in confirmed
+	assert '已签到' in already
+
+	# auto 只证明"触发了"，措辞里不得出现任何"签到已完成"式的断言
+	assert '签到成功' not in unconfirmed
+	assert '已签到' not in unconfirmed
+
+	assert '签到成功' not in failed
 
 
 def test_unknown_status_is_echoed_not_swallowed():
