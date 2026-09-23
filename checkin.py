@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -42,6 +42,12 @@ from utils.proxy import get_playwright_proxy, get_proxy_server
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+# 跨运行的签到状态：记录每个账号上一次观测到的「总量」（余额 + 累计消耗）。
+# 单次运行的签到窗口只有几秒，抓不到在两次运行之间到账的奖励 —— 实测 agentrouter
+# 的 $25 就是这么漏掉的。跨日比较总量才能看出「今天到底到账了没有」。
+CHECKIN_STATE_FILE = 'checkin_state.json'
+CHECKIN_STATE_VERSION = 1
+DEFAULT_TZ_OFFSET_HOURS = 8
 
 # 签到结果状态。
 # 之前通知里只看余额差，导致「真的调用了签到接口」和「今天已经签过」都渲染成同一句
@@ -61,6 +67,10 @@ CHECK_IN_STATUS_LABELS = {
 	STATUS_AUTO_CHECKED: '✅ 已触发自动签到（未获接口确认）',
 	STATUS_FAILED: '❌ 签到失败',
 }
+
+# agentrouter 没有签到接口。但若跨日总量确有增加，说明服务端确实发了额度，
+# 这就是它唯一能拿到的实证，用它把「未获接口确认」升级掉。
+AUTO_CHECKED_WITH_GAIN_LABEL = '✅ 总量已增加（推断签到到账）'
 
 
 @dataclass
@@ -112,6 +122,78 @@ def generate_balance_hash(balances):
 	)
 	balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
+
+
+def current_day() -> str:
+	"""当前"签到日"（YYYY-MM-DD）。
+
+	平台按自己的时区切日，因此不能直接用 runner 的 UTC 日期。默认按 UTC+8 计算，
+	可用 CHECKIN_TZ_OFFSET 覆盖。这个值只决定"何时把基准刷新成前一天收尾值"，
+	选偏了最多晚一轮体现，不会算错金额。
+	"""
+	raw = os.getenv('CHECKIN_TZ_OFFSET', str(DEFAULT_TZ_OFFSET_HOURS)).strip()
+	try:
+		offset_hours = int(raw)
+	except ValueError:
+		print(f'Warning: invalid CHECKIN_TZ_OFFSET={raw!r}, falling back to {DEFAULT_TZ_OFFSET_HOURS}')
+		offset_hours = DEFAULT_TZ_OFFSET_HOURS
+
+	return (datetime.now(timezone.utc) + timedelta(hours=offset_hours)).strftime('%Y-%m-%d')
+
+
+def load_checkin_state() -> dict:
+	"""读取跨运行的账号状态 {账号名: {day, baseline_total, baseline_day, last_total}}。"""
+	try:
+		if os.path.exists(CHECKIN_STATE_FILE):
+			with open(CHECKIN_STATE_FILE, 'r', encoding='utf-8') as f:
+				data = json.load(f)
+			if isinstance(data, dict):
+				accounts = data.get('accounts')
+				if isinstance(accounts, dict):
+					return accounts
+			print(f'Warning: {CHECKIN_STATE_FILE} format unexpected, starting fresh')
+	except Exception as e:
+		print(f'Warning: Failed to load check-in state: {e}')
+	return {}
+
+
+def save_checkin_state(accounts_state: dict) -> None:
+	"""保存跨运行状态。失败不影响签到本身，只影响下次的日级比较。"""
+	try:
+		payload = {'version': CHECKIN_STATE_VERSION, 'accounts': accounts_state}
+		with open(CHECKIN_STATE_FILE, 'w', encoding='utf-8') as f:
+			json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+	except Exception as e:
+		print(f'Warning: Failed to save check-in state: {e}')
+
+
+def resolve_baseline(stored: dict | None, today: str) -> tuple[float | None, str | None]:
+	"""返回今日总量比较基准 (baseline_total, baseline_day)。
+
+	- 同一天内沿用已建立的基准，否则会被后续运行冲掉，"今日累计"就没了
+	- 跨天时用上一次观测值（即前一天的收尾总量）作为新基准
+	"""
+	if not stored:
+		return None, None
+
+	if stored.get('day') == today:
+		return stored.get('baseline_total'), stored.get('baseline_day')
+
+	return stored.get('last_total'), stored.get('day')
+
+
+def compute_day_gain(total: float | None, baseline_total: float | None) -> float | None:
+	"""今日总量增量；没有基准时返回 None（首次运行/状态丢失）。"""
+	if total is None or baseline_total is None:
+		return None
+	return round(total - baseline_total, 2)
+
+
+def resolve_outcome_label(outcome: CheckInOutcome, day_gain: float | None) -> str:
+	"""agentrouter 拿不到签到回执；若跨日总量确有增加，就把这个实证补进措辞。"""
+	if outcome.status == STATUS_AUTO_CHECKED and day_gain is not None and day_gain > 0:
+		return AUTO_CHECKED_WITH_GAIN_LABEL
+	return outcome.label
 
 
 def parse_cookies(cookies_data):
@@ -358,9 +440,30 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict) 
 	return CheckInOutcome(STATUS_FAILED, str(error_msg))
 
 
+def format_total_line(detail: dict) -> str | None:
+	"""「总量（余额 + 累计消耗）」以及相对上次记录的增量。
+
+	总量是唯一不受日常消耗干扰的口径：你消耗时余额减、累计消耗增，两者抵消。
+	跨日比较它才能看出"今天到底到账了没有"—— 单次运行的几秒窗口看不到
+	在两次运行之间到账的奖励。
+	"""
+	total = detail.get('total')
+	if total is None:
+		return None
+
+	line = f'  总量: ${total:.2f}'
+	day_gain = detail.get('day_gain')
+	if day_gain is None:
+		return f'{line}  |  较上次记录: 暂无基线'
+
+	baseline_day = detail.get('baseline_day') or '上次记录'
+	sign = '+' if day_gain > 0 else ''
+	return f'{line}  |  较上次记录({baseline_day}): {sign}${day_gain:.2f}'
+
+
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
-	status_label = CHECK_IN_STATUS_LABELS.get(detail.get('status', ''), '')
+	status_label = detail.get('label') or CHECK_IN_STATUS_LABELS.get(detail.get('status', ''), '')
 	title = f'[CHECK-IN] {detail["name"]}'
 	if status_label:
 		title += f'  {status_label}'
@@ -373,6 +476,10 @@ def format_check_in_notification(detail: dict) -> str:
 		'  签到后',
 		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
 	]
+
+	total_line = format_total_line(detail)
+	if total_line:
+		lines.append(total_line)
 
 	if detail.get('message'):
 		lines.append(f'  说明: {detail["message"]}')
@@ -556,6 +663,9 @@ async def main():
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
 	last_balance_hash = load_balance_hash()
+	checkin_state = load_checkin_state()
+	today = current_day()
+	print(f'[INFO] Sign-in day: {today}, state loaded for {len(checkin_state)} account(s)')
 
 	success_count = 0
 	total_count = len(accounts)
@@ -569,12 +679,35 @@ async def main():
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		account_name = account.get_display_name(i)
+		baseline_total, baseline_day = resolve_baseline(checkin_state.get(account_name), today)
 		try:
 			outcome, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if outcome.success:
 				success_count += 1
 
-			status_line = f'  {outcome.label} {account_name}'
+			# 跨运行的总量比较：抓单次运行窗口之外的到账（agentrouter 唯一能拿到的实证）
+			day_gain = None
+			total_after = None
+			if user_info_after and user_info_after.get('success'):
+				total_after = round(user_info_after['quota'] + user_info_after['used_quota'], 2)
+				day_gain = compute_day_gain(total_after, baseline_total)
+				checkin_state[account_name] = {
+					'day': today,
+					'baseline_total': baseline_total,
+					'baseline_day': baseline_day,
+					'last_total': total_after,
+				}
+			elif user_info_before and user_info_before.get('success'):
+				checkin_state[account_name] = {
+					'day': today,
+					'baseline_total': baseline_total,
+					'baseline_day': baseline_day,
+					'last_total': round(user_info_before['quota'] + user_info_before['used_quota'], 2),
+				}
+
+			outcome_label = resolve_outcome_label(outcome, day_gain)
+
+			status_line = f'  {outcome_label} {account_name}'
 			if outcome.message:
 				status_line += f' —— {outcome.message}'
 			status_lines.append(status_line)
@@ -582,6 +715,8 @@ async def main():
 			if not outcome.success:
 				need_notify = True
 				print(f'[NOTIFY] {account_name} failed, will send notification')
+			if day_gain is not None:
+				print(f'[INFO] {account_name}: total ${total_after:.2f}, day gain {day_gain:+.2f} vs {baseline_day}')
 
 			if user_info_after and user_info_after.get('success'):
 				current_quota = user_info_after['quota']
@@ -611,11 +746,15 @@ async def main():
 						'usage_increase': usage_increase,
 						'balance_change': balance_change,
 						'status': outcome.status,
+						'label': outcome_label,
 						'message': outcome.message,
+						'total': total_after,
+						'day_gain': day_gain,
+						'baseline_day': baseline_day,
 					}
 
 			if not outcome.success:
-				account_result = f'{outcome.label} {account_name}'
+				account_result = f'{outcome_label} {account_name}'
 				if outcome.message:
 					account_result += f'\n  原因: {outcome.message}'
 				if user_info_after and user_info_after.get('success'):
@@ -629,6 +768,8 @@ async def main():
 			need_notify = True
 			status_lines.append(f'  ❌ {account_name} —— 执行异常: {str(e)[:50]}...')
 			notification_content.append(f'❌ {account_name} —— 执行异常: {str(e)[:50]}...')
+
+	save_checkin_state(checkin_state)
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:

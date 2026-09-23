@@ -1,10 +1,12 @@
 from checkin import (
+	AUTO_CHECKED_WITH_GAIN_LABEL,
 	STATUS_ALREADY_CHECKED,
 	STATUS_AUTO_CHECKED,
 	STATUS_CHECKED_IN,
 	STATUS_FAILED,
 	CheckInOutcome,
 	format_check_in_notification,
+	format_total_line,
 )
 
 
@@ -16,8 +18,12 @@ def make_detail(
 	usage=0.0,
 	before=100.0,
 	after=100.0,
+	total=None,
+	day_gain=None,
+	baseline_day=None,
+	label='',
 ):
-	return {
+	detail = {
 		'name': name,
 		'before_quota': before,
 		'before_used': 900.0,
@@ -29,6 +35,13 @@ def make_detail(
 		'status': status,
 		'message': message,
 	}
+	if total is not None:
+		detail['total'] = total
+		detail['day_gain'] = day_gain
+		detail['baseline_day'] = baseline_day
+	if label:
+		detail['label'] = label
+	return detail
 
 
 # --- CheckInOutcome.success 语义 -------------------------------------------------
@@ -149,3 +162,51 @@ def test_missing_status_field_does_not_crash():
 
 	assert '[CHECK-IN] any主帐号' in text
 	assert '余额无变化' in text
+
+
+# --- 总量 / 跨日增量 ---------------------------------------------------------------
+
+
+def test_total_line_shows_day_gain_against_baseline():
+	text = format_check_in_notification(make_detail(total=1075.0, day_gain=25.0, baseline_day='2026-09-22'))
+
+	assert '总量: $1075.00' in text
+	assert '较上次记录(2026-09-22): +$25.00' in text
+
+
+def test_total_line_without_baseline_says_so():
+	"""首次运行没有基准，要明确说出来，而不是假装增量是 0。"""
+	text = format_check_in_notification(make_detail(total=1075.0, day_gain=None))
+
+	assert '总量: $1075.00' in text
+	assert '暂无基线' in text
+
+
+def test_total_line_reports_negative_gain():
+	"""平台重置累计消耗会让总量倒退，如实显示。"""
+	text = format_check_in_notification(make_detail(total=900.0, day_gain=-100.0, baseline_day='2026-09-22'))
+
+	assert '较上次记录(2026-09-22): $-100.00' in text
+
+
+def test_total_line_absent_when_total_unavailable():
+	text = format_check_in_notification(make_detail())
+
+	assert '总量' not in text
+
+
+def test_format_total_line_directly():
+	assert format_total_line({'total': 1000.0, 'day_gain': 0.0, 'baseline_day': '2026-09-22'}) == (
+		'  总量: $1000.00  |  较上次记录(2026-09-22): $0.00'
+	)
+	assert format_total_line({'total': 1000.0}) == '  总量: $1000.00  |  较上次记录: 暂无基线'
+	assert format_total_line({}) is None
+	assert format_total_line({'total': None}) is None
+
+
+def test_detail_label_overrides_status_lookup():
+	"""main() 会把升级后的标签放进 detail，通知应以它为准。"""
+	text = format_check_in_notification(make_detail(status=STATUS_AUTO_CHECKED, label=AUTO_CHECKED_WITH_GAIN_LABEL))
+
+	assert AUTO_CHECKED_WITH_GAIN_LABEL in text
+	assert '未获接口确认' not in text
