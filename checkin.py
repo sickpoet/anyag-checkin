@@ -55,22 +55,19 @@ DEFAULT_TZ_OFFSET_HOURS = 8
 #
 # 注意 STATUS_AUTO_CHECKED 的证据强度低于前两者：agentrouter 没有签到接口
 # （sign_in_path 为 None），只能确认「查询用户信息成功」，拿不到服务端对签到本身的
-# 显式回执。因此它的措辞不声称「签到成功」，只说明"已触发、未获接口确认"。
+# 显式回执。因此它的措辞不声称「签到成功」。
 STATUS_CHECKED_IN = 'checked_in'
 STATUS_ALREADY_CHECKED = 'already_checked'
 STATUS_AUTO_CHECKED = 'auto'
 STATUS_FAILED = 'failed'
 
+# 精简版标签：通知改成一行一个账号，标签必须短。
 CHECK_IN_STATUS_LABELS = {
 	STATUS_CHECKED_IN: '✅ 签到成功',
-	STATUS_ALREADY_CHECKED: '✅ 今日已签到（本次为重复调用）',
-	STATUS_AUTO_CHECKED: '✅ 已触发自动签到（未获接口确认）',
+	STATUS_ALREADY_CHECKED: '✅ 今日已签到',
+	STATUS_AUTO_CHECKED: '✅ 自动签到',
 	STATUS_FAILED: '❌ 签到失败',
 }
-
-# agentrouter 没有签到接口。但若跨日总量确有增加，说明服务端确实发了额度，
-# 这就是它唯一能拿到的实证，用它把「未获接口确认」升级掉。
-AUTO_CHECKED_WITH_GAIN_LABEL = '✅ 总量已增加（推断签到到账）'
 
 
 @dataclass
@@ -187,13 +184,6 @@ def compute_day_gain(total: float | None, baseline_total: float | None) -> float
 	if total is None or baseline_total is None:
 		return None
 	return round(total - baseline_total, 2)
-
-
-def resolve_outcome_label(outcome: CheckInOutcome, day_gain: float | None) -> str:
-	"""agentrouter 拿不到签到回执；若跨日总量确有增加，就把这个实证补进措辞。"""
-	if outcome.status == STATUS_AUTO_CHECKED and day_gain is not None and day_gain > 0:
-		return AUTO_CHECKED_WITH_GAIN_LABEL
-	return outcome.label
 
 
 def parse_cookies(cookies_data):
@@ -440,71 +430,36 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict) 
 	return CheckInOutcome(STATUS_FAILED, str(error_msg))
 
 
-def format_total_line(detail: dict) -> str | None:
-	"""「总量（余额 + 累计消耗）」以及相对上次记录的增量。
-
-	总量是唯一不受日常消耗干扰的口径：你消耗时余额减、累计消耗增，两者抵消。
-	跨日比较它才能看出"今天到底到账了没有"—— 单次运行的几秒窗口看不到
-	在两次运行之间到账的奖励。
-	"""
-	total = detail.get('total')
-	if total is None:
-		return None
-
-	line = f'  总量: ${total:.2f}'
-	day_gain = detail.get('day_gain')
+def format_delta(day_gain: float | None) -> str:
+	"""日增量的一小段文本：+$25.00 / -$100.00 / $0.00 / 基线待建立。"""
 	if day_gain is None:
-		return f'{line}  |  较上次记录: 暂无基线'
+		return '基线待建立'
+	if day_gain > 0:
+		return f'+${day_gain:.2f}'
+	if day_gain < 0:
+		return f'-${abs(day_gain):.2f}'
+	return '$0.00'
 
-	baseline_day = detail.get('baseline_day') or '上次记录'
-	sign = '+' if day_gain > 0 else ''
-	return f'{line}  |  较上次记录({baseline_day}): {sign}${day_gain:.2f}'
 
+def format_account_line(
+	account_name: str,
+	outcome: CheckInOutcome,
+	*,
+	total: float | None = None,
+	day_gain: float | None = None,
+) -> str:
+	"""一行一个账号：名称 · 状态 · 总量 · 日增量。
 
-def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息"""
-	status_label = detail.get('label') or CHECK_IN_STATUS_LABELS.get(detail.get('status', ''), '')
-	title = f'[CHECK-IN] {detail["name"]}'
-	if status_label:
-		title += f'  {status_label}'
+	总量 = 余额 + 累计消耗，是唯一不受日常消费干扰的口径；日增量跨运行比较得出，
+	能抓到在两次运行之间到账的奖励。失败时用原因替代数字，避免误导。
+	"""
+	if not outcome.success:
+		return f'{account_name} · {outcome.label} · {outcome.message or "未知原因"}'
 
-	lines = [
-		title,
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
-	]
+	if total is None:
+		return f'{account_name} · {outcome.label}'
 
-	total_line = format_total_line(detail)
-	if total_line:
-		lines.append(total_line)
-
-	if detail.get('message'):
-		lines.append(f'  说明: {detail["message"]}')
-
-	has_reward = detail['check_in_reward'] != 0
-	has_usage = detail['usage_increase'] != 0
-
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		if has_reward:
-			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
-		elif has_usage:
-			lines.append('  本次未检测到签到奖励')
-
-		if has_usage:
-			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
-
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
-	else:
-		lines.append('  余额无变化')
-
-	return '\n'.join(lines)
+	return f'{account_name} · {outcome.label} · 总量 ${total:.2f} · {format_delta(day_gain)}'
 
 
 async def check_in_account(
@@ -669,12 +624,9 @@ async def main():
 
 	success_count = 0
 	total_count = len(accounts)
-	notification_content = []
 	status_lines: list[str] = []
 	current_balances = {}
-	account_check_in_details = {}
 	need_notify = False
-	balance_changed = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -685,12 +637,17 @@ async def main():
 			if outcome.success:
 				success_count += 1
 
-			# 跨运行的总量比较：抓单次运行窗口之外的到账（agentrouter 唯一能拿到的实证）
-			day_gain = None
+			# 跨运行的总量比较：抓单次运行窗口之外的到账。
+			# 总量 = 余额 + 累计消耗，消费时两者一增一减恰好抵消，所以它不受日常消耗干扰。
 			total_after = None
+			day_gain = None
 			if user_info_after and user_info_after.get('success'):
 				total_after = round(user_info_after['quota'] + user_info_after['used_quota'], 2)
 				day_gain = compute_day_gain(total_after, baseline_total)
+				current_balances[account_key] = {
+					'quota': user_info_after['quota'],
+					'used': user_info_after['used_quota'],
+				}
 				checkin_state[account_name] = {
 					'day': today,
 					'baseline_total': baseline_total,
@@ -705,12 +662,7 @@ async def main():
 					'last_total': round(user_info_before['quota'] + user_info_before['used_quota'], 2),
 				}
 
-			outcome_label = resolve_outcome_label(outcome, day_gain)
-
-			status_line = f'  {outcome_label} {account_name}'
-			if outcome.message:
-				status_line += f' —— {outcome.message}'
-			status_lines.append(status_line)
+			status_lines.append(format_account_line(account_name, outcome, total=total_after, day_gain=day_gain))
 
 			if not outcome.success:
 				need_notify = True
@@ -718,108 +670,31 @@ async def main():
 			if day_gain is not None:
 				print(f'[INFO] {account_name}: total ${total_after:.2f}, day gain {day_gain:+.2f} vs {baseline_day}')
 
-			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'status': outcome.status,
-						'label': outcome_label,
-						'message': outcome.message,
-						'total': total_after,
-						'day_gain': day_gain,
-						'baseline_day': baseline_day,
-					}
-
-			if not outcome.success:
-				account_result = f'{outcome_label} {account_name}'
-				if outcome.message:
-					account_result += f'\n  原因: {outcome.message}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
-
 		except Exception as e:
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True
-			status_lines.append(f'  ❌ {account_name} —— 执行异常: {str(e)[:50]}...')
-			notification_content.append(f'❌ {account_name} —— 执行异常: {str(e)[:50]}...')
+			status_lines.append(f'{account_name} · ❌ 执行异常 · {str(e)[:50]}...')
 
 	save_checkin_state(checkin_state)
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
 		if last_balance_hash is None:
-			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] First run detected, will send notification with current balances')
 		elif current_balance_hash != last_balance_hash:
-			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] Balance changes detected, will send notification')
 		else:
 			print('[INFO] No balance changes detected')
 
-	if balance_changed:
-		for i, account in enumerate(accounts):
-			account_key = f'account_{i + 1}'
-			if account_key in account_check_in_details:
-				detail = account_check_in_details[account_key]
-				account_name = detail['name']
-				account_result = format_check_in_notification(detail)
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
-
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
-	if need_notify and notification_content:
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
+	if need_notify:
+		header = f'📊 AnyRouter 签到 · {datetime.now().strftime("%m-%d %H:%M")} · {success_count}/{total_count} 成功'
+		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])
 
-		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
-		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
-		else:
-			summary.append('[ERROR] All accounts check-in failed')
-
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
-		sections = [time_info]
-		if status_lines:
-			sections.append('\n'.join(['[STATUS] 账号签到状态总览:', *status_lines]))
-		sections.append('\n'.join(notification_content))
-		sections.append('\n'.join(summary))
-
-		notify_content = '\n\n'.join(sections)
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
 		if screenshot_paths:
 			github_run_id = os.getenv('GITHUB_RUN_ID', '').strip()

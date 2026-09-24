@@ -1,212 +1,120 @@
 from checkin import (
-	AUTO_CHECKED_WITH_GAIN_LABEL,
 	STATUS_ALREADY_CHECKED,
 	STATUS_AUTO_CHECKED,
 	STATUS_CHECKED_IN,
 	STATUS_FAILED,
 	CheckInOutcome,
-	format_check_in_notification,
-	format_total_line,
+	format_account_line,
+	format_delta,
 )
 
+# --- 标签 --------------------------------------------------------------------------
 
-def make_detail(
-	name='any主帐号',
-	status=STATUS_CHECKED_IN,
-	message='',
-	reward=0.0,
-	usage=0.0,
-	before=100.0,
-	after=100.0,
-	total=None,
-	day_gain=None,
-	baseline_day=None,
-	label='',
-):
-	detail = {
-		'name': name,
-		'before_quota': before,
-		'before_used': 900.0,
-		'after_quota': after,
-		'after_used': 900.0 + usage,
-		'check_in_reward': reward,
-		'usage_increase': usage,
-		'balance_change': after - before,
-		'status': status,
-		'message': message,
+
+def test_labels_distinguish_each_status():
+	labels = {
+		STATUS_CHECKED_IN: '✅ 签到成功',
+		STATUS_ALREADY_CHECKED: '✅ 今日已签到',
+		STATUS_AUTO_CHECKED: '✅ 自动签到',
+		STATUS_FAILED: '❌ 签到失败',
 	}
-	if total is not None:
-		detail['total'] = total
-		detail['day_gain'] = day_gain
-		detail['baseline_day'] = baseline_day
-	if label:
-		detail['label'] = label
-	return detail
+	for status, expected in labels.items():
+		assert CheckInOutcome(status).label == expected
+
+	assert len(set(labels.values())) == 4
 
 
-# --- CheckInOutcome.success 语义 -------------------------------------------------
+def test_labels_stay_short_enough_for_one_line():
+	"""通知是一行一个账号，标签长了就违背精简的初衷。"""
+	for status in (STATUS_CHECKED_IN, STATUS_ALREADY_CHECKED, STATUS_AUTO_CHECKED, STATUS_FAILED):
+		assert len(CheckInOutcome(status).label) <= 8
 
 
-def test_already_checked_and_auto_count_as_success():
-	"""今天该账号的签到已完成，因此"重复调用"和"自动触发"都算成功。"""
+def test_auto_label_does_not_claim_confirmed_check_in():
+	"""agentrouter 没有签到接口，只能确认"查询成功"，不能声称"签到成功"。"""
+	label = CheckInOutcome(STATUS_AUTO_CHECKED).label
+
+	assert '签到成功' not in label
+	assert '自动签到' in label
+
+
+def test_success_semantics():
 	assert CheckInOutcome(STATUS_CHECKED_IN).success is True
 	assert CheckInOutcome(STATUS_ALREADY_CHECKED).success is True
 	assert CheckInOutcome(STATUS_AUTO_CHECKED).success is True
 	assert CheckInOutcome(STATUS_FAILED).success is False
 
 
-def test_labels_distinguish_each_status():
-	labels = {
-		STATUS_CHECKED_IN: '✅ 签到成功',
-		STATUS_ALREADY_CHECKED: '✅ 今日已签到（本次为重复调用）',
-		STATUS_AUTO_CHECKED: '✅ 已触发自动签到（未获接口确认）',
-		STATUS_FAILED: '❌ 签到失败',
-	}
-	for status, expected in labels.items():
-		assert CheckInOutcome(status).label == expected
-
-	# 四种状态的标签必须互不相同，否则通知里又分不出来了
-	assert len(set(labels.values())) == 4
-
-
-def test_auto_label_does_not_claim_confirmed_check_in():
-	"""agentrouter 没有签到接口，只能确认"查询成功"，不能声称"签到成功"。
-
-	它的证据强度低于 checked_in / already_checked，措辞必须体现这一点。
-	"""
-	label = CheckInOutcome(STATUS_AUTO_CHECKED).label
-
-	assert '签到成功' not in label
-	assert '未获接口确认' in label
-
-
-def test_only_server_confirmed_statuses_claim_check_in_success():
-	"""只有拿到服务端回执的状态才允许声称签到已完成。"""
-	confirmed = CheckInOutcome(STATUS_CHECKED_IN).label
-	already = CheckInOutcome(STATUS_ALREADY_CHECKED).label
-	unconfirmed = CheckInOutcome(STATUS_AUTO_CHECKED).label
-	failed = CheckInOutcome(STATUS_FAILED).label
-
-	assert '签到成功' in confirmed
-	assert '已签到' in already
-
-	# auto 只证明"触发了"，措辞里不得出现任何"签到已完成"式的断言
-	assert '签到成功' not in unconfirmed
-	assert '已签到' not in unconfirmed
-
-	assert '签到成功' not in failed
-
-
 def test_unknown_status_is_echoed_not_swallowed():
 	assert CheckInOutcome('something_new').label == 'something_new'
 
 
-# --- format_check_in_notification -------------------------------------------------
+# --- format_delta ------------------------------------------------------------------
 
 
-def test_each_status_renders_its_own_label():
-	"""这是本次修复的核心：不同签到结果不能在通知里渲染成同一句话。"""
-	rendered = {
-		status: format_check_in_notification(make_detail(status=status))
-		for status in (STATUS_CHECKED_IN, STATUS_ALREADY_CHECKED, STATUS_AUTO_CHECKED, STATUS_FAILED)
-	}
-
-	assert len(set(rendered.values())) == 4
-	for status, text in rendered.items():
-		assert CheckInOutcome(status).label in text
+def test_format_delta():
+	assert format_delta(25.0) == '+$25.00'
+	assert format_delta(0.0) == '$0.00'
+	assert format_delta(-100.0) == '-$100.00'
+	assert format_delta(None) == '基线待建立'
 
 
-def test_misleading_wording_is_gone():
-	""" "今日已签到，无变化" 曾让成功/重复/失败看起来一模一样。"""
-	for status in (STATUS_CHECKED_IN, STATUS_ALREADY_CHECKED, STATUS_AUTO_CHECKED, STATUS_FAILED):
-		text = format_check_in_notification(make_detail(status=status))
-		assert '今日已签到，无变化' not in text
+# --- format_account_line -----------------------------------------------------------
 
 
-def test_reward_is_shown_when_balance_grows():
-	text = format_check_in_notification(make_detail(reward=0.5, after=100.5))
+def test_line_shows_total_and_gain():
+	line = format_account_line('any主帐号', CheckInOutcome(STATUS_CHECKED_IN), total=2400.0, day_gain=25.0)
 
-	assert '签到获得: +$0.50' in text
-	assert '余额变化: +$0.50' in text
-	assert '余额无变化' not in text
+	assert line == 'any主帐号 · ✅ 签到成功 · 总量 $2400.00 · +$25.00'
 
 
-def test_usage_without_reward_is_reported_as_no_reward():
-	text = format_check_in_notification(make_detail(status=STATUS_ALREADY_CHECKED, usage=1.2))
+def test_line_marks_no_growth_explicitly():
+	line = format_account_line('agLD', CheckInOutcome(STATUS_AUTO_CHECKED), total=1075.0, day_gain=0.0)
 
-	assert '本次未检测到签到奖励' in text
-	assert '期间消耗: $1.20' in text
-	assert '签到获得' not in text
-
-
-def test_unchanged_balance_says_no_change():
-	text = format_check_in_notification(make_detail(status=STATUS_AUTO_CHECKED))
-
-	assert '余额无变化' in text
-	assert '签到获得' not in text
+	assert '总量 $1075.00' in line
+	assert line.endswith('· $0.00')
 
 
-def test_failure_message_is_included():
-	text = format_check_in_notification(make_detail(status=STATUS_FAILED, message='HTTP 401'))
+def test_line_without_baseline():
+	line = format_account_line('agLD', CheckInOutcome(STATUS_AUTO_CHECKED), total=1075.0, day_gain=None)
 
-	assert '❌ 签到失败' in text
-	assert '说明: HTTP 401' in text
-
-
-def test_missing_status_field_does_not_crash():
-	"""增量/旧配置路径下 detail 可能没有 status，不能因此炸掉通知。"""
-	detail = make_detail()
-	del detail['status']
-
-	text = format_check_in_notification(detail)
-
-	assert '[CHECK-IN] any主帐号' in text
-	assert '余额无变化' in text
+	assert line == 'agLD · ✅ 自动签到 · 总量 $1075.00 · 基线待建立'
 
 
-# --- 总量 / 跨日增量 ---------------------------------------------------------------
+def test_line_reports_negative_gain():
+	line = format_account_line('agLD', CheckInOutcome(STATUS_AUTO_CHECKED), total=900.0, day_gain=-100.0)
+
+	assert line.endswith('· -$100.00')
 
 
-def test_total_line_shows_day_gain_against_baseline():
-	text = format_check_in_notification(make_detail(total=1075.0, day_gain=25.0, baseline_day='2026-09-22'))
-
-	assert '总量: $1075.00' in text
-	assert '较上次记录(2026-09-22): +$25.00' in text
-
-
-def test_total_line_without_baseline_says_so():
-	"""首次运行没有基准，要明确说出来，而不是假装增量是 0。"""
-	text = format_check_in_notification(make_detail(total=1075.0, day_gain=None))
-
-	assert '总量: $1075.00' in text
-	assert '暂无基线' in text
-
-
-def test_total_line_reports_negative_gain():
-	"""平台重置累计消耗会让总量倒退，如实显示。"""
-	text = format_check_in_notification(make_detail(total=900.0, day_gain=-100.0, baseline_day='2026-09-22'))
-
-	assert '较上次记录(2026-09-22): $-100.00' in text
-
-
-def test_total_line_absent_when_total_unavailable():
-	text = format_check_in_notification(make_detail())
-
-	assert '总量' not in text
-
-
-def test_format_total_line_directly():
-	assert format_total_line({'total': 1000.0, 'day_gain': 0.0, 'baseline_day': '2026-09-22'}) == (
-		'  总量: $1000.00  |  较上次记录(2026-09-22): $0.00'
+def test_failure_line_shows_reason_instead_of_numbers():
+	"""失败时数字没有意义，用原因替代，避免被误读成"没增长"。"""
+	line = format_account_line(
+		'agLD',
+		CheckInOutcome(STATUS_FAILED, '邮箱密码登录失败'),
+		total=1075.0,
+		day_gain=25.0,
 	)
-	assert format_total_line({'total': 1000.0}) == '  总量: $1000.00  |  较上次记录: 暂无基线'
-	assert format_total_line({}) is None
-	assert format_total_line({'total': None}) is None
+
+	assert line == 'agLD · ❌ 签到失败 · 邮箱密码登录失败'
+	assert '总量' not in line
+	assert '+$25.00' not in line
 
 
-def test_detail_label_overrides_status_lookup():
-	"""main() 会把升级后的标签放进 detail，通知应以它为准。"""
-	text = format_check_in_notification(make_detail(status=STATUS_AUTO_CHECKED, label=AUTO_CHECKED_WITH_GAIN_LABEL))
+def test_failure_line_without_reason_still_readable():
+	line = format_account_line('agLD', CheckInOutcome(STATUS_FAILED))
 
-	assert AUTO_CHECKED_WITH_GAIN_LABEL in text
-	assert '未获接口确认' not in text
+	assert line == 'agLD · ❌ 签到失败 · 未知原因'
+
+
+def test_success_line_without_total_omits_amounts():
+	"""拿不到用户信息时不能编造数字。"""
+	line = format_account_line('agLD', CheckInOutcome(STATUS_AUTO_CHECKED))
+
+	assert line == 'agLD · ✅ 自动签到'
+
+
+def test_one_line_per_account_has_no_newlines():
+	for status in (STATUS_CHECKED_IN, STATUS_ALREADY_CHECKED, STATUS_AUTO_CHECKED, STATUS_FAILED):
+		line = format_account_line('acct', CheckInOutcome(status, 'boom'), total=100.0, day_gain=1.0)
+		assert '\n' not in line

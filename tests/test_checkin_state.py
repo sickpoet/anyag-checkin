@@ -7,16 +7,9 @@ sys.path.insert(0, str(project_root))
 
 import checkin
 from checkin import (
-	AUTO_CHECKED_WITH_GAIN_LABEL,
-	STATUS_ALREADY_CHECKED,
-	STATUS_AUTO_CHECKED,
-	STATUS_CHECKED_IN,
-	STATUS_FAILED,
-	CheckInOutcome,
 	compute_day_gain,
 	generate_balance_hash,
 	resolve_baseline,
-	resolve_outcome_label,
 )
 
 # --- 余额 hash（原有） ------------------------------------------------------------
@@ -136,33 +129,6 @@ def test_compute_day_gain_without_baseline():
 def test_compute_day_gain_can_be_negative():
 	"""平台若重置累计消耗，总量会倒退，如实反映而不是藏起来。"""
 	assert compute_day_gain(900.0, 1000.0) == -100.0
-
-
-# --- 标签升级 resolve_outcome_label ------------------------------------------------
-
-
-def test_auto_label_upgraded_when_total_grew():
-	"""agentrouter 拿到"总量增加"这个实证后，不再只说"未获接口确认"。"""
-	label = resolve_outcome_label(CheckInOutcome(STATUS_AUTO_CHECKED), 25.0)
-
-	assert label == AUTO_CHECKED_WITH_GAIN_LABEL
-	assert '总量已增加' in label
-	assert '未获接口确认' not in label
-
-
-def test_auto_label_kept_when_no_gain_or_no_baseline():
-	kept = CheckInOutcome(STATUS_AUTO_CHECKED).label
-
-	assert resolve_outcome_label(CheckInOutcome(STATUS_AUTO_CHECKED), 0.0) == kept
-	assert resolve_outcome_label(CheckInOutcome(STATUS_AUTO_CHECKED), None) == kept
-	assert resolve_outcome_label(CheckInOutcome(STATUS_AUTO_CHECKED), -1.0) == kept
-
-
-def test_gain_does_not_override_server_confirmed_labels():
-	"""已被服务端确认的状态不需要推断，标签保持原样。"""
-	for status in (STATUS_CHECKED_IN, STATUS_ALREADY_CHECKED, STATUS_FAILED):
-		outcome = CheckInOutcome(status)
-		assert resolve_outcome_label(outcome, 25.0) == outcome.label
 
 
 # --- 状态文件读写 ------------------------------------------------------------------
