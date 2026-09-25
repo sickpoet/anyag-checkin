@@ -121,21 +121,45 @@ def generate_balance_hash(balances):
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
 
-def current_day() -> str:
-	"""当前"签到日"（YYYY-MM-DD）。
-
-	平台按自己的时区切日，因此不能直接用 runner 的 UTC 日期。默认按 UTC+8 计算，
-	可用 CHECKIN_TZ_OFFSET 覆盖。这个值只决定"何时把基准刷新成前一天收尾值"，
-	选偏了最多晚一轮体现，不会算错金额。
-	"""
+def tz_offset_hours() -> int:
+	"""签到日所在时区的偏移（小时），默认 UTC+8。"""
 	raw = os.getenv('CHECKIN_TZ_OFFSET', str(DEFAULT_TZ_OFFSET_HOURS)).strip()
 	try:
-		offset_hours = int(raw)
+		return int(raw)
 	except ValueError:
 		print(f'Warning: invalid CHECKIN_TZ_OFFSET={raw!r}, falling back to {DEFAULT_TZ_OFFSET_HOURS}')
-		offset_hours = DEFAULT_TZ_OFFSET_HOURS
+		return DEFAULT_TZ_OFFSET_HOURS
 
-	return (datetime.now(timezone.utc) + timedelta(hours=offset_hours)).strftime('%Y-%m-%d')
+
+def tz_label() -> str:
+	"""时区标签，用于通知和日志，避免把 UTC 误读成本地时间。"""
+	offset = tz_offset_hours()
+	return '北京时间' if offset == DEFAULT_TZ_OFFSET_HOURS else f'UTC{offset:+d}'
+
+
+def local_tz() -> timezone:
+	"""签到日所在时区（默认 UTC+8）。"""
+	return timezone(timedelta(hours=tz_offset_hours()))
+
+
+def local_now() -> datetime:
+	"""签到日所在时区的当前时间（默认北京时间），而不是 runner 的 UTC 时间。
+
+	用真正的 timezone 对象而不是"UTC 加几小时"，否则会得到一个自称 UTC、
+	实际是 UTC+8 的 aware datetime。
+	"""
+	return datetime.now(local_tz())
+
+
+def current_day() -> str:
+	"""当前「签到日」（YYYY-MM-DD），以北京时间 0 点为界。
+
+	两个平台的赠送时间都锚在北京时间上（agentrouter 每天 00:05 到账、
+	anyrouter 每天 08:05 之后登录才赠送），所以用北京 0 点切日最自然：
+	"前一天收尾总量"就是当天该拿多少的比较基准。
+	可用 CHECKIN_TZ_OFFSET 覆盖。
+	"""
+	return local_now().strftime('%Y-%m-%d')
 
 
 def load_checkin_state() -> dict:
@@ -600,7 +624,10 @@ async def main():
 		print('[INFO] Debug mode disabled (set DEBUG_MODE=true to enable screenshots and verbose logs)')
 
 	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started')
-	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+	print(
+		f'[TIME] Execution time: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")} UTC'
+		f' / {local_now().strftime("%Y-%m-%d %H:%M:%S")} {tz_label()}'
+	)
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
@@ -692,7 +719,10 @@ async def main():
 		save_balance_hash(current_balance_hash)
 
 	if need_notify:
-		header = f'📊 AnyRouter 签到 · {datetime.now().strftime("%m-%d %H:%M")} · {success_count}/{total_count} 成功'
+		header = (
+			f'📊 AnyRouter 签到 · {local_now().strftime("%m-%d %H:%M")} {tz_label()}'
+			f' · {success_count}/{total_count} 成功'
+		)
 		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])
 
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []

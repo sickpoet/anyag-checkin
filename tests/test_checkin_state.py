@@ -42,7 +42,53 @@ def test_balance_hash_is_stable_for_equivalent_balances():
 	assert generate_balance_hash(left) == generate_balance_hash(right)
 
 
-# --- 签到日 current_day ------------------------------------------------------------
+# --- 时区 / 签到日 ------------------------------------------------------------------
+
+
+def test_tz_offset_hours_defaults_to_beijing(monkeypatch):
+	monkeypatch.delenv('CHECKIN_TZ_OFFSET', raising=False)
+	assert checkin.tz_offset_hours() == 8
+
+
+def test_tz_offset_hours_can_be_overridden(monkeypatch):
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '0')
+	assert checkin.tz_offset_hours() == 0
+
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '-5')
+	assert checkin.tz_offset_hours() == -5
+
+
+def test_tz_offset_hours_tolerates_invalid(monkeypatch):
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', 'beijing')
+	assert checkin.tz_offset_hours() == 8
+
+
+def test_tz_label(monkeypatch):
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '8')
+	assert checkin.tz_label() == '北京时间'
+
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '0')
+	assert checkin.tz_label() == 'UTC+0'
+
+
+def test_local_now_is_really_in_the_target_zone(monkeypatch):
+	"""local_now() 必须是"真正的 UTC+8"，而不是伪装成 UTC 的偏移量。"""
+	from datetime import datetime, timezone
+
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '8')
+	local = checkin.local_now()
+
+	assert local.utcoffset().total_seconds() / 3600 == 8
+	# 与真实 UTC 的挂钟时间相差 8 小时
+	wall_delta = local.replace(tzinfo=None) - datetime.now(timezone.utc).replace(tzinfo=None)
+	assert 7.9 < wall_delta.total_seconds() / 3600 < 8.1
+
+
+def test_current_day_follows_local_now(monkeypatch):
+	"""北京 0 点切日：签到日必须跟北京日期一致，而不是 runner 的 UTC 日期。"""
+	monkeypatch.setenv('CHECKIN_TZ_OFFSET', '8')
+
+	assert checkin.current_day() == checkin.local_now().strftime('%Y-%m-%d')
 
 
 def test_current_day_returns_iso_date(monkeypatch):
