@@ -470,9 +470,10 @@ def format_account_line(
 	outcome: CheckInOutcome,
 	*,
 	total: float | None = None,
+	balance: float | None = None,
 	day_gain: float | None = None,
 ) -> str:
-	"""一行一个账号：名称 · 状态 · 总量 · 日增量。
+	"""一行一个账号：名称 · 状态 · 总量 · 余额 · 日增量。
 
 	总量 = 余额 + 累计消耗，是唯一不受日常消费干扰的口径；日增量跨运行比较得出，
 	能抓到在两次运行之间到账的奖励。失败时用原因替代数字，避免误导。
@@ -483,7 +484,12 @@ def format_account_line(
 	if total is None:
 		return f'{account_name} · {outcome.label}'
 
-	return f'{account_name} · {outcome.label} · 总量 ${total:.2f} · {format_delta(day_gain)}'
+	parts = [account_name, outcome.label, f'总量 ${total:.2f}']
+	if balance is not None:
+		parts.append(f'余额 ${balance:.2f}')
+	parts.append(format_delta(day_gain))
+
+	return ' · '.join(parts)
 
 
 async def check_in_account(
@@ -667,9 +673,11 @@ async def main():
 			# 跨运行的总量比较：抓单次运行窗口之外的到账。
 			# 总量 = 余额 + 累计消耗，消费时两者一增一减恰好抵消，所以它不受日常消耗干扰。
 			total_after = None
+			balance_after = None
 			day_gain = None
 			if user_info_after and user_info_after.get('success'):
-				total_after = round(user_info_after['quota'] + user_info_after['used_quota'], 2)
+				balance_after = user_info_after['quota']
+				total_after = round(balance_after + user_info_after['used_quota'], 2)
 				day_gain = compute_day_gain(total_after, baseline_total)
 				current_balances[account_key] = {
 					'quota': user_info_after['quota'],
@@ -689,7 +697,15 @@ async def main():
 					'last_total': round(user_info_before['quota'] + user_info_before['used_quota'], 2),
 				}
 
-			status_lines.append(format_account_line(account_name, outcome, total=total_after, day_gain=day_gain))
+			status_lines.append(
+				format_account_line(
+					account_name,
+					outcome,
+					total=total_after,
+					balance=balance_after,
+					day_gain=day_gain,
+				)
+			)
 
 			if not outcome.success:
 				need_notify = True

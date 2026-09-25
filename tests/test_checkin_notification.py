@@ -62,10 +62,37 @@ def test_format_delta():
 # --- format_account_line -----------------------------------------------------------
 
 
-def test_line_shows_total_and_gain():
-	line = format_account_line('any主帐号', CheckInOutcome(STATUS_CHECKED_IN), total=2400.0, day_gain=25.0)
+def test_line_shows_total_balance_and_gain():
+	line = format_account_line(
+		'any主帐号',
+		CheckInOutcome(STATUS_CHECKED_IN),
+		total=2400.0,
+		balance=565.45,
+		day_gain=25.0,
+	)
 
-	assert line == 'any主帐号 · ✅ 签到成功 · 总量 $2400.00 · +$25.00'
+	assert line == 'any主帐号 · ✅ 签到成功 · 总量 $2400.00 · 余额 $565.45 · +$25.00'
+
+
+def test_line_shows_balance_even_when_total_unchanged():
+	"""余额是你实际在意的数字之一，即使总量没涨也要显示。"""
+	line = format_account_line(
+		'agLD',
+		CheckInOutcome(STATUS_AUTO_CHECKED),
+		total=1125.0,
+		balance=146.55,
+		day_gain=0.0,
+	)
+
+	assert '余额 $146.55' in line
+	assert line.endswith('· $0.00')
+
+
+def test_line_omits_balance_when_unknown():
+	line = format_account_line('agLD', CheckInOutcome(STATUS_AUTO_CHECKED), total=1075.0, day_gain=25.0)
+
+	assert '余额' not in line
+	assert line == 'agLD · ✅ 自动签到 · 总量 $1075.00 · +$25.00'
 
 
 def test_line_marks_no_growth_explicitly():
