@@ -454,15 +454,31 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict) 
 	return CheckInOutcome(STATUS_FAILED, str(error_msg))
 
 
-def format_delta(day_gain: float | None) -> str:
-	"""日增量的一小段文本：+$25.00 / -$100.00 / $0.00 / 基线待建立。"""
+def short_day(day: str | None) -> str:
+	"""'2026-09-23' -> '09-23'，用于在增量后面紧凑地标出基准日。"""
+	if not day:
+		return ''
+	return day[5:] if len(day) >= 10 else day
+
+
+def format_delta(day_gain: float | None, baseline_day: str | None = None) -> str:
+	"""日增量文本：+$25.00(较09-23) / $0.00(较09-23) / 基线待建立。
+
+	标出基准日是必要的：增量到底是跟哪天比的，不写出来没人猜得到。
+	（曾经出现过 +$50.00 看起来像算错，其实就是跟前天比、期间到账两笔。）
+	"""
 	if day_gain is None:
 		return '基线待建立'
+
 	if day_gain > 0:
-		return f'+${day_gain:.2f}'
-	if day_gain < 0:
-		return f'-${abs(day_gain):.2f}'
-	return '$0.00'
+		text = f'+${day_gain:.2f}'
+	elif day_gain < 0:
+		text = f'-${abs(day_gain):.2f}'
+	else:
+		text = '$0.00'
+
+	day_label = short_day(baseline_day)
+	return f'{text}(较{day_label})' if day_label else text
 
 
 def format_account_line(
@@ -472,8 +488,9 @@ def format_account_line(
 	total: float | None = None,
 	balance: float | None = None,
 	day_gain: float | None = None,
+	baseline_day: str | None = None,
 ) -> str:
-	"""一行一个账号：名称 · 状态 · 总量 · 余额 · 日增量。
+	"""一行一个账号：名称 · 状态 · 总量 · 余额 · 日增量(较基准日)。
 
 	总量 = 余额 + 累计消耗，是唯一不受日常消费干扰的口径；日增量跨运行比较得出，
 	能抓到在两次运行之间到账的奖励。失败时用原因替代数字，避免误导。
@@ -487,7 +504,7 @@ def format_account_line(
 	parts = [account_name, outcome.label, f'总量 ${total:.2f}']
 	if balance is not None:
 		parts.append(f'余额 ${balance:.2f}')
-	parts.append(format_delta(day_gain))
+	parts.append(format_delta(day_gain, baseline_day))
 
 	return ' · '.join(parts)
 
@@ -704,6 +721,7 @@ async def main():
 					total=total_after,
 					balance=balance_after,
 					day_gain=day_gain,
+					baseline_day=baseline_day,
 				)
 			)
 

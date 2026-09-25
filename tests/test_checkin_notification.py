@@ -6,6 +6,7 @@ from checkin import (
 	CheckInOutcome,
 	format_account_line,
 	format_delta,
+	short_day,
 )
 
 # --- 标签 --------------------------------------------------------------------------
@@ -59,6 +60,21 @@ def test_format_delta():
 	assert format_delta(None) == '基线待建立'
 
 
+def test_format_delta_labels_the_baseline_day():
+	"""增量必须说明是跟哪天比的，否则 +$50 会看起来像算错。"""
+	assert format_delta(50.0, '2026-09-23') == '+$50.00(较09-23)'
+	assert format_delta(0.0, '2026-09-24') == '$0.00(较09-24)'
+	assert format_delta(-100.0, '2026-09-23') == '-$100.00(较09-23)'
+	assert format_delta(None, '2026-09-24') == '基线待建立'
+
+
+def test_short_day():
+	assert short_day('2026-09-23') == '09-23'
+	assert short_day(None) == ''
+	assert short_day('') == ''
+	assert short_day('weird') == 'weird'
+
+
 # --- format_account_line -----------------------------------------------------------
 
 
@@ -69,9 +85,24 @@ def test_line_shows_total_balance_and_gain():
 		total=2400.0,
 		balance=565.45,
 		day_gain=25.0,
+		baseline_day='2026-09-23',
 	)
 
-	assert line == 'any主帐号 · ✅ 签到成功 · 总量 $2400.00 · 余额 $565.45 · +$25.00'
+	assert line == 'any主帐号 · ✅ 签到成功 · 总量 $2400.00 · 余额 $565.45 · +$25.00(较09-23)'
+
+
+def test_line_explains_a_double_gain_via_baseline_day():
+	"""真实案例：+$50 看起来像算错，标出基准日就能自解释。"""
+	line = format_account_line(
+		'agLD',
+		CheckInOutcome(STATUS_AUTO_CHECKED),
+		total=1125.0,
+		balance=146.55,
+		day_gain=50.0,
+		baseline_day='2026-09-23',
+	)
+
+	assert line.endswith('· +$50.00(较09-23)')
 
 
 def test_line_shows_balance_even_when_total_unchanged():
