@@ -53,19 +53,19 @@ DEFAULT_TZ_OFFSET_HOURS = 8
 # 之前通知里只看余额差，导致「真的调用了签到接口」和「今天已经签过」都渲染成同一句
 # 「今日已签到，无变化」，从消息里根本看不出签到到底成功没有。现在显式区分。
 #
-# 注意 STATUS_AUTO_CHECKED 的证据强度低于前两者：agentrouter 没有签到接口
-# （sign_in_path 为 None），只能确认「查询用户信息成功」，拿不到服务端对签到本身的
-# 显式回执。因此它的措辞不声称「签到成功」。
+# STATUS_LOGGED_IN 的语义与另外两个不同：agentrouter 没有签到接口（sign_in_path 为
+# None），而且是「登录即到账」—— 不存在独立的签到动作，也没有任何服务端回执。
+# 因此它只说「已登录」，不声称「签到成功」。
 STATUS_CHECKED_IN = 'checked_in'
 STATUS_ALREADY_CHECKED = 'already_checked'
-STATUS_AUTO_CHECKED = 'auto'
+STATUS_LOGGED_IN = 'logged_in'
 STATUS_FAILED = 'failed'
 
 # 精简版标签：通知改成一行一个账号，标签必须短。
 CHECK_IN_STATUS_LABELS = {
 	STATUS_CHECKED_IN: '✅ 签到成功',
 	STATUS_ALREADY_CHECKED: '✅ 今日已签到',
-	STATUS_AUTO_CHECKED: '✅ 自动签到',
+	STATUS_LOGGED_IN: '✅ 已登录',
 	STATUS_FAILED: '❌ 签到失败',
 }
 
@@ -74,9 +74,9 @@ CHECK_IN_STATUS_LABELS = {
 class CheckInOutcome:
 	"""单个账号的签到结果。
 
-	success 表示「今天该账号的签到已完成」，因此 already_checked / auto 也算成功。
-	但三者的证据强度不同：checked_in / already_checked 来自服务端回执，
-	auto 只表示"查询成功、服务端据此自动签到"，拿不到签到本身的确认。
+	success 表示「今天该账号的签到流程已完成」，因此 already_checked / logged_in
+	也算成功。但三者的证据强度不同：checked_in / already_checked 来自服务端回执，
+	logged_in 只表示"登录成功"—— agentrouter 是登录即到账，没有独立的签到动作。
 	message 用于在通知里补充失败原因等说明。
 	"""
 
@@ -462,10 +462,9 @@ def short_day(day: str | None) -> str:
 
 
 def format_delta(day_gain: float | None, baseline_day: str | None = None) -> str:
-	"""日增量文本：+$25.00(较09-23) / $0.00(较09-23) / 基线待建立。
+	"""额度有没有变化 —— 这一行才回答"签到到底成没成"。
 
-	标出基准日是必要的：增量到底是跟哪天比的，不写出来没人猜得到。
-	（曾经出现过 +$50.00 看起来像算错，其实就是跟前天比、期间到账两笔。）
+	+$25.00(较09-24) / 未到账(较09-24) / -$100.00(较09-24) / 基线待建立
 	"""
 	if day_gain is None:
 		return '基线待建立'
@@ -475,7 +474,7 @@ def format_delta(day_gain: float | None, baseline_day: str | None = None) -> str
 	elif day_gain < 0:
 		text = f'-${abs(day_gain):.2f}'
 	else:
-		text = '$0.00'
+		text = '未到账'
 
 	day_label = short_day(baseline_day)
 	return f'{text}(较{day_label})' if day_label else text
@@ -490,21 +489,22 @@ def format_account_line(
 	day_gain: float | None = None,
 	baseline_day: str | None = None,
 ) -> str:
-	"""一行一个账号：名称 · 状态 · 总量 · 余额 · 日增量(较基准日)。
+	"""一行一个账号，主角是「额度有没有变化」。
 
-	总量 = 余额 + 累计消耗，是唯一不受日常消费干扰的口径；日增量跨运行比较得出，
-	能抓到在两次运行之间到账的奖励。失败时用原因替代数字，避免误导。
+	成功时不显示登录状态 —— 那不重要，还会和「未到账」并排造成误读
+	（曾经出现 ✅ 已登录 + $0.00 同时出现，看起来自相矛盾）。
+	只有失败时才显示状态和原因。
 	"""
 	if not outcome.success:
 		return f'{account_name} · {outcome.label} · {outcome.message or "未知原因"}'
 
 	if total is None:
-		return f'{account_name} · {outcome.label}'
+		return f'{account_name} · 额度读取失败'
 
-	parts = [account_name, outcome.label, f'总量 ${total:.2f}']
+	parts = [account_name, format_delta(day_gain, baseline_day)]
 	if balance is not None:
 		parts.append(f'余额 ${balance:.2f}')
-	parts.append(format_delta(day_gain, baseline_day))
+	parts.append(f'总量 ${total:.2f}')
 
 	return ' · '.join(parts)
 
@@ -623,10 +623,10 @@ def run_check_in_requests(
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				return CheckInOutcome(STATUS_AUTO_CHECKED), user_info_before, user_info_after
+				print(f'[INFO] {account_name}: Logged in and user info fetched (this provider credits on login)')
+				return CheckInOutcome(STATUS_LOGGED_IN), user_info_before, user_info_after
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
-			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
+			print(f'[FAILED] {account_name}: Login/user-info failed - {error}')
 			return CheckInOutcome(STATUS_FAILED, str(error)), user_info_before, user_info_after
 
 	except Exception as e:
@@ -674,6 +674,8 @@ async def main():
 
 	success_count = 0
 	total_count = len(accounts)
+	gained_count = 0
+	baseline_ready = 0
 	status_lines: list[str] = []
 	current_balances = {}
 	need_notify = False
@@ -729,6 +731,9 @@ async def main():
 				need_notify = True
 				print(f'[NOTIFY] {account_name} failed, will send notification')
 			if day_gain is not None:
+				baseline_ready += 1
+				if day_gain > 0:
+					gained_count += 1
 				print(f'[INFO] {account_name}: total ${total_after:.2f}, day gain {day_gain:+.2f} vs {baseline_day}')
 
 		except Exception as e:
@@ -753,10 +758,10 @@ async def main():
 		save_balance_hash(current_balance_hash)
 
 	if need_notify:
-		header = (
-			f'📊 AnyRouter 签到 · {local_now().strftime("%m-%d %H:%M")} {tz_label()}'
-			f' · {success_count}/{total_count} 成功'
-		)
+		header = f'📊 AnyRouter 签到 · {local_now().strftime("%m-%d %H:%M")} {tz_label()}'
+		if baseline_ready:
+			# 标题直接给"几个账号到账了"，而不是"几个账号登录成功了"
+			header += f' · 到账 {gained_count}/{total_count}'
 		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])
 
 		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
