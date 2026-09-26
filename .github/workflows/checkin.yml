@@ -1,7 +1,12 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # 北京时间 08:10 与 00:10（= UTC 00:10 / 16:10），分别紧跟两个平台的赠送时间：
+    #   agentrouter  每天 00:05 到账
+    #   anyrouter    每天 08:05 之后登录才赠送
+    # 每天 2 次而非每 6 小时，是为了减少重复浏览器登录的次数（降低被限流的风险）。
+    # 注意 GitHub 的 schedule 常有延迟，实际会晚一些，偶尔整次丢弃。
+    - cron: '10 0,16 * * *'
   workflow_dispatch:
     inputs:
       debug:
