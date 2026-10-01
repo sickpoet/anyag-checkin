@@ -53,6 +53,10 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+# 到了 /console 却没读到 /api/user/self 时的复查次数与间隔。
+# 这类失败通常是接口抖动，重试一两次即可；不重试会让一整天白丢。
+VERIFY_ATTEMPTS = 3
+VERIFY_RETRY_DELAY_SECONDS = 3.0
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -427,8 +431,8 @@ async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_
 	return False
 
 
-async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。"""
+async def _capture_user_profile(page: Page, console_url: str, timeout_ms: int) -> dict | None:
+	"""导航到 /console，并拦截页面自己发出的 /api/user/self 响应。"""
 	verify_timeout = min(timeout_ms, SESSION_WAIT_TIMEOUT_MS)
 	captured_profile: dict | None = None
 	verified = asyncio.Event()
@@ -444,7 +448,6 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 
 	page.on('response', on_response)
 	try:
-		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
 		await page.goto(console_url, wait_until='load', timeout=min(timeout_ms, 60_000))
 		try:
 			await page.wait_for_load_state('networkidle', timeout=20_000)
@@ -459,20 +462,46 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 	finally:
 		page.remove_listener('response', on_response)
 
-	if captured_profile:
-		if is_debug_enabled():
-			user_id = captured_profile.get('id')
-			username = captured_profile.get('username', '')
-			print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}: id={user_id}, username={username}')
-		else:
-			print('[INFO] Login verified')
-		return captured_profile
+	return captured_profile
 
-	if CONSOLE_PATH in page.url.lower():
+
+async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
+	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。
+
+	到达 /console 就说明**登录本身已经成功**，剩下的只是"那一瞬间没读到用户资料"
+	（接口抖动、XHR 时机、页面还在初始化）。这种情况重试一次通常就好了，
+	不能直接判定登录失败 —— 实测 agentrouter 就这么白丢过整天的签到：
+	日志里明明是 "Reached /console"，却被当成 "Login failed"。
+	"""
+	print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
+
+	reached_console = False
+	for attempt in range(1, VERIFY_ATTEMPTS + 1):
+		if attempt > 1:
+			print(f'[WARN] No user profile yet, re-checking (attempt {attempt}/{VERIFY_ATTEMPTS})')
+
+		profile = await _capture_user_profile(page, console_url, timeout_ms)
+		if profile:
+			if is_debug_enabled():
+				user_id = profile.get('id')
+				username = profile.get('username', '')
+				print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}: id={user_id}, username={username}')
+			else:
+				print('[INFO] Login verified')
+			return profile
+
+		if CONSOLE_PATH not in page.url.lower():
+			# 停在登录页 = 真的没登录进去，重试没有意义
+			debug_print(f'[WARN] Login verification failed: current URL={page.url}')
+			print('[WARN] Login verification failed')
+			return None
+
+		reached_console = True
 		print(f'[WARN] Reached {CONSOLE_PATH} but {USER_SELF_API_SUFFIX} returned no user profile')
-	else:
-		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
-		print('[WARN] Login verification failed')
+		await asyncio.sleep(VERIFY_RETRY_DELAY_SECONDS)
+
+	if reached_console:
+		print(f'[WARN] Still no user profile after {VERIFY_ATTEMPTS} attempts')
 	return None
 
 
