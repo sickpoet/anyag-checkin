@@ -36,6 +36,8 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
+from utils.mlgb import MlgbError
+from utils.mlgb import run_check_in as mlgb_check_in
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
@@ -77,11 +79,18 @@ class CheckInOutcome:
 	success 表示「今天该账号的签到流程已完成」，因此 already_checked / logged_in
 	也算成功。但三者的证据强度不同：checked_in / already_checked 来自服务端回执，
 	logged_in 只表示"登录成功"—— agentrouter 是登录即到账，没有独立的签到动作。
+
 	message 用于在通知里补充失败原因等说明。
+	note    用于成功时给出一句结论（mlgb7 这类字段完全不同的平台用它替代
+	        "总量/余额"），例如「+125 积分 · 累计签到 31 天 · 余额 4227」。
+	credited 表示"今天确认有到账"，供标题统计使用；非 newapi 平台自己给出，
+	        newapi 平台由日增量推导。
 	"""
 
 	status: str
 	message: str = ''
+	note: str = ''
+	credited: bool = False
 
 	@property
 	def success(self) -> bool:
@@ -498,6 +507,10 @@ def format_account_line(
 	if not outcome.success:
 		return f'{account_name} · {outcome.label} · {outcome.message or "未知原因"}'
 
+	# 字段完全不同的平台（mlgb7）自带一句结论，不走"总量/余额"那套
+	if outcome.note:
+		return f'{account_name} · {outcome.label} · {outcome.note}'
+
 	if total is None:
 		return f'{account_name} · 额度读取失败'
 
@@ -507,6 +520,55 @@ def format_account_line(
 	parts.append(f'总量 ${total:.2f}')
 
 	return ' · '.join(parts)
+
+
+def run_mlgb_account(
+	account_name: str, account: AccountConfig, provider_config
+) -> tuple[CheckInOutcome, dict | None, dict | None]:
+	"""噜皮生图（mlgb7）签到。
+
+	该站登录走 Linux DO 授权、没有站内密码，所以只能复用会话 cookie。
+	它自己有权威的签到状态（`checked_in_today`），因此不需要日增量推断；
+	到账金额直接取自积分明细里的 `daily_checkin` 记录。
+	"""
+	user_cookies = parse_cookies(account.cookies)
+	if not user_cookies:
+		print(f'[FAILED] {account_name}: 缺少会话 cookies')
+		return CheckInOutcome(STATUS_FAILED, '缺少会话 cookies'), None, None
+
+	proxy_url = get_proxy_server(use_proxy=provider_config.use_proxy)
+	print(f'[NETWORK] {account_name}: Querying {provider_config.domain}/api/me')
+
+	try:
+		result = mlgb_check_in(provider_config.domain, user_cookies, proxy_url=proxy_url)
+	except MlgbError as exc:
+		print(f'[FAILED] {account_name}: {exc}')
+		return CheckInOutcome(STATUS_FAILED, str(exc)), None, None
+
+	if not result.checked_in:
+		print(f'[FAILED] {account_name}: Still not checked in after the request')
+		return CheckInOutcome(STATUS_FAILED, '调用签到后服务端仍未显示已签到'), None, None
+
+	status = STATUS_CHECKED_IN if result.awarded else STATUS_ALREADY_CHECKED
+	award = result.today_award if result.today_award is not None else result.reward
+
+	parts = []
+	if award and award > 0:
+		parts.append(f'+{award:.0f} 积分')
+	if result.checkin_days:
+		parts.append(f'累计签到 {result.checkin_days} 天')
+	parts.append(f'余额 {result.points:.0f}')
+
+	if result.awarded:
+		print(f'[SUCCESS] {account_name}: Check-in successful (+{award:.0f} 积分)')
+	else:
+		print(f'[SUCCESS] {account_name}: Already checked in today')
+
+	return (
+		CheckInOutcome(status, note=' · '.join(parts), credited=bool(award and award > 0)),
+		None,
+		None,
+	)
 
 
 async def check_in_account(
@@ -522,6 +584,10 @@ async def check_in_account(
 		return CheckInOutcome(STATUS_FAILED, f'provider "{account.provider}" 未配置'), None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+
+	# 非 NewAPI 平台走各自的适配器
+	if provider_config.adapter == 'mlgb7':
+		return run_mlgb_account(account_name, account, provider_config)
 
 	# 邮箱密码优先
 	all_cookies = None
@@ -675,7 +741,7 @@ async def main():
 	success_count = 0
 	total_count = len(accounts)
 	gained_count = 0
-	baseline_ready = 0
+	credit_known = 0
 	status_lines: list[str] = []
 	current_balances = {}
 	need_notify = False
@@ -731,10 +797,14 @@ async def main():
 				need_notify = True
 				print(f'[NOTIFY] {account_name} failed, will send notification')
 			if day_gain is not None:
-				baseline_ready += 1
+				credit_known += 1
 				if day_gain > 0:
 					gained_count += 1
 				print(f'[INFO] {account_name}: total ${total_after:.2f}, day gain {day_gain:+.2f} vs {baseline_day}')
+			elif outcome.credited:
+				# 自带到账状态的平台（mlgb7）由它自己给出，不靠日增量推断
+				credit_known += 1
+				gained_count += 1
 
 		except Exception as e:
 			print(f'[FAILED] {account_name} processing exception: {e}')
@@ -759,7 +829,7 @@ async def main():
 
 	if need_notify:
 		header = f'📊 AnyRouter 签到 · {local_now().strftime("%m-%d %H:%M")} {tz_label()}'
-		if baseline_ready:
+		if credit_known:
 			# 标题直接给"几个账号到账了"，而不是"几个账号登录成功了"
 			header += f' · 到账 {gained_count}/{total_count}'
 		notify_content = '\n\n'.join([header, '\n'.join(status_lines)])

@@ -23,6 +23,10 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 	use_proxy: bool = False
 	persist_profile: bool = False
+	# 适配器：接口形状不是 NewAPI 的平台要靠它分派。
+	#   newapi —— 默认，anyrouter / agentrouter 这类
+	#   mlgb7  —— 噜皮生图（image.mlgb7.com），登录走 Linux DO，只能复用会话 cookie
+	adapter: str = 'newapi'
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -61,6 +65,7 @@ class ProviderConfig:
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
 			use_proxy=data.get('use_proxy', default_use_proxy),
 			persist_profile=data.get('persist_profile', default_persist_profile),
+			adapter=data.get('adapter', defaults.adapter if defaults else 'newapi'),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -105,6 +110,18 @@ class AppConfig:
 				waf_cookie_names=['acw_tc'],
 				use_proxy=True,
 				persist_profile=False,
+			),
+			# 噜皮生图：不是 NewAPI，接口与字段都不同，由 mlgb7 适配器处理。
+			# 账号只能用会话 cookie（该站登录走 Linux DO 授权，没有站内密码）。
+			'mlgb7': ProviderConfig(
+				name='mlgb7',
+				domain='https://image.mlgb7.com',
+				login_path='',
+				sign_in_path='/api/me/checkin',
+				user_info_path='/api/me',
+				api_user_key='',
+				use_proxy=False,
+				adapter='mlgb7',
 			),
 		}
 
