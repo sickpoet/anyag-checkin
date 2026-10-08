@@ -700,6 +700,26 @@ def run_check_in_requests(
 		return CheckInOutcome(STATUS_FAILED, str(e)[:50]), None, None
 
 
+def filter_accounts_by_provider(
+	accounts: list[AccountConfig], raw_filter: str | None
+) -> tuple[list[AccountConfig], list[AccountConfig]]:
+	"""按 CHECKIN_PROVIDERS 收窄本次要处理的账号。
+
+	留空 = 不限制（定时任务默认行为，一次覆盖全部账号，当作兜底）。
+	设置后只处理 provider 命中的账号，用来实现「00:01 只签 agentrouter + mlgb7、
+	08:01 只签 anyrouter」这类分组 —— 配合外部定时器触发 workflow_dispatch。
+
+	返回 (待处理, 被跳过)。
+	"""
+	names = {item.strip().lower() for item in (raw_filter or '').split(',') if item.strip()}
+	if not names:
+		return accounts, []
+
+	kept = [account for account in accounts if account.provider.lower() in names]
+	skipped = [account for account in accounts if account.provider.lower() not in names]
+	return kept, skipped
+
+
 async def main():
 	"""主函数"""
 	if is_debug_enabled():
@@ -732,6 +752,15 @@ async def main():
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
+
+	accounts, skipped_accounts = filter_accounts_by_provider(accounts, os.getenv('CHECKIN_PROVIDERS'))
+	for skipped in skipped_accounts:
+		print(f'[SKIP] {skipped.name or skipped.provider}: provider "{skipped.provider}" 不在本次范围内')
+	if not accounts:
+		print('[FAILED] CHECKIN_PROVIDERS 过滤后没有待处理的账号，程序退出')
+		sys.exit(1)
+	if skipped_accounts:
+		print(f'[INFO] Processing {len(accounts)} account(s), skipped {len(skipped_accounts)}')
 
 	last_balance_hash = load_balance_hash()
 	checkin_state = load_checkin_state()

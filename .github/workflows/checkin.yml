@@ -15,6 +15,11 @@ on:
     - cron: '10 0,6,12 * * *'
   workflow_dispatch:
     inputs:
+      providers:
+        description: 只处理这些 provider（逗号分隔，如 agentrouter,mlgb7）；留空 = 全部账号
+        required: false
+        default: ''
+        type: string
       debug:
         description: 开启调试模式（截图 artifact、详细日志）
         required: false
@@ -104,6 +109,9 @@ jobs:
     - name: 执行签到
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
+        # 外部定时器触发 workflow_dispatch 时可指定只跑哪些 provider；
+        # 定时任务（schedule）不带这个参数，因此每次覆盖全部账号，当作兜底。
+        CHECKIN_PROVIDERS: ${{ github.event.inputs.providers }}
         CHECKIN_HEADLESS: false
         CHECKIN_HUMANIZE: true
         CHECKIN_WAIT_TIMEOUT_MS: 120000
