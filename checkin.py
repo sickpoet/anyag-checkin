@@ -163,7 +163,7 @@ def local_now() -> datetime:
 def current_day() -> str:
 	"""当前「签到日」（YYYY-MM-DD），以北京时间 0 点为界。
 
-	两个平台的赠送时间都锚在北京时间上（agentrouter 每天 00:05 到账、
+	两个平台的赠送时间都锚在北京时间上（agentrouter 每天 00:01 到账、
 	anyrouter 每天 08:05 之后登录才赠送），所以用北京 0 点切日最自然：
 	"前一天收尾总量"就是当天该拿多少的比较基准。
 	可用 CHECKIN_TZ_OFFSET 覆盖。
