@@ -7,6 +7,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from utils import align
 from utils.align import (
 	EVENING_PROVIDERS,
 	MORNING_PROVIDERS,
@@ -117,3 +118,83 @@ def test_utc_input_is_converted_correctly():
 def test_sleep_with_heartbeat_returns_quickly_for_short_sleeps():
 	sleep_with_heartbeat(0.05)  # 不该抛异常、不该真的睡很久
 	sleep_with_heartbeat(0)  # 0 秒直接返回
+
+
+# --- main() 的胶水：写 CHECKIN_PROVIDERS 并睡觉 ---------------------------------
+
+
+def freeze_clock(monkeypatch, moment: datetime):
+	"""把 align 模块里的 datetime.now() 冻结到指定时刻。"""
+
+	class FrozenDatetime(datetime):
+		@classmethod
+		def now(cls, tz=None):  # noqa: ANN001
+			return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+	monkeypatch.setattr(align, 'datetime', FrozenDatetime)
+
+
+def prepare(monkeypatch, tmp_path):
+	env_file = tmp_path / 'github_env'
+	env_file.write_text('', encoding='utf-8')
+	monkeypatch.setenv('GITHUB_ENV', str(env_file))
+	monkeypatch.delenv('MANUAL_PROVIDERS', raising=False)
+	monkeypatch.setenv('ALIGN_MAX_SLEEP_SECONDS', '18000')
+	slept: list[float] = []
+	monkeypatch.setattr(align, 'sleep_with_heartbeat', slept.append)
+	return env_file, slept
+
+
+def test_main_sleeps_and_scopes_to_ag_group(monkeypatch, tmp_path):
+	"""北京 23:59 落地 -> 睡 2 分钟到次日 00:01，只签 ag+mlgb7。"""
+	env_file, slept = prepare(monkeypatch, tmp_path)
+	freeze_clock(monkeypatch, at(23, 59))
+
+	assert align.main() == 0
+
+	assert 'CHECKIN_PROVIDERS=agentrouter,mlgb7' in env_file.read_text(encoding='utf-8')
+	assert slept == [120.0]
+
+
+def test_main_sleeps_and_scopes_to_anyrouter(monkeypatch, tmp_path):
+	"""北京 07:59 落地 -> 睡 2 分钟到当日 08:01，只签 anyrouter。"""
+	env_file, slept = prepare(monkeypatch, tmp_path)
+	freeze_clock(monkeypatch, at(7, 59))
+
+	assert align.main() == 0
+
+	assert 'CHECKIN_PROVIDERS=anyrouter' in env_file.read_text(encoding='utf-8')
+	assert slept == [120.0]
+
+
+def test_main_fallback_sleeps_not_and_writes_nothing(monkeypatch, tmp_path):
+	"""北京 13:30 落地（比如 UTC 00:10 槽）-> 不睡也不限制，跑全部账号。"""
+	env_file, slept = prepare(monkeypatch, tmp_path)
+	freeze_clock(monkeypatch, at(13, 30))
+
+	assert align.main() == 0
+
+	assert 'CHECKIN_PROVIDERS' not in env_file.read_text(encoding='utf-8')
+	assert slept == []
+
+
+def test_main_honours_manual_providers_without_sleeping(monkeypatch, tmp_path):
+	"""手动触发指定了 providers 时不参与对齐。"""
+	env_file, slept = prepare(monkeypatch, tmp_path)
+	monkeypatch.setenv('MANUAL_PROVIDERS', 'anyrouter')
+	freeze_clock(monkeypatch, at(23, 59))  # 即便落在对齐窗口也不睡
+
+	assert align.main() == 0
+
+	assert 'CHECKIN_PROVIDERS=anyrouter' in env_file.read_text(encoding='utf-8')
+	assert slept == []
+
+
+def test_main_without_github_env_does_not_crash(monkeypatch, tmp_path):
+	"""本地跑没有 $GITHUB_ENV，只打日志、不写文件、不报错。"""
+	_, slept = prepare(monkeypatch, tmp_path)
+	monkeypatch.delenv('GITHUB_ENV', raising=False)
+	freeze_clock(monkeypatch, at(23, 59))
+
+	assert align.main() == 0
+	assert slept == [120.0]
